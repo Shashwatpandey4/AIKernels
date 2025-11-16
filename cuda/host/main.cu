@@ -128,7 +128,7 @@ int main()
             max_diff = diff;
     }
 
-    std::cout << "Max difference vs cuBLAS: " << max_diff << std::endl;
+    std::cout << "Result diff : " << max_diff << std::endl;
 
     CHECK_CUBLAS(cublasDestroy(handle));
 
