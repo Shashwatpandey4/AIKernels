@@ -1,1 +1,24 @@
 .venv
+
+# Ignore build directory
+build/
+
+# Ignore compiled binaries
+*.out
+*.exe
+*.bin
+gemm_test
+
+# Ignore object files & CUDA intermediates
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# CUDA compilation artifacts
+*.cudafe*
+*.fatbin
+*.cubin
+*.ptx
