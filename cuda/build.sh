@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+
 # resolve paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/.."
@@ -13,6 +14,8 @@ echo "building sgemm... "
 nvcc \
   "${SCRIPT_DIR}/host/main.cu" \
   "${SCRIPT_DIR}/kernels/sgemm_naive.cu" \
+  "${SCRIPT_DIR}/kernels/sgemm_smem.cu" \
+  "${SCRIPT_DIR}/kernels/sgemm_swizzled.cu" \
   -lcublas \
   -o "${BINARY}"
 
@@ -22,3 +25,5 @@ echo "running sgemm"
 echo "---------------------"
 "${BINARY}"
 echo "---------------------"
+
+

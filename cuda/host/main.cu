@@ -4,6 +4,8 @@
 #include <cmath>
 #include "cuda_utils.cuh"
 #include "../kernels/sgemm_naive.cuh"
+#include "../kernels/sgemm_smem.cuh"
+#include "../kernels/sgemm_swizzled.cuh"
 
 #define N 4096
 
@@ -27,7 +29,7 @@ int main()
 
     if (!A_h || !B_h || !C_h || !C_h_ref)
     {
-        std::cerr << "failed to allocate host memmory !" << std::endl;
+        std::cerr << "failed to allocate host memory!" << std::endl;
         std::free(A_h);
         std::free(B_h);
         std::free(C_h);
@@ -35,7 +37,7 @@ int main()
         return EXIT_FAILURE;
     }
 
-    // initialinzing matrices
+    // initializing matrices
     for (size_t i = 0; i < static_cast<size_t>(N) * N; ++i)
     {
         A_h[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
@@ -61,40 +63,76 @@ int main()
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    // launching the kernel
-    // time it
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
+    // --------------------
+    // 1) Naive kernel perf
+    // --------------------
     CHECK_CUDA(cudaEventRecord(start));
-
     run_sgemm_naive(A_d, B_d, C_d, N, alpha, beta);
-
     CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop)); // wait till the kernel is done
+    CHECK_CUDA(cudaEventSynchronize(stop));
 
-    float ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+    float ms_naive = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&ms_naive, start, stop));
 
-    double ops = 2.0 * static_cast<double>(N) * N * N;
-    double secs = ms * 1e-3;
-    double gflops = (ops / secs) * 1e-9;
+    double flops = 2.0 * static_cast<double>(N) * N * N;
+    double gflops_naive = flops / (ms_naive * 1e6);
 
-    std::cout << "kernel time: " << ms << " ms\n";
-    std::cout << "kernel perf: " << gflops << " GFLOPS\n";
+    std::cout << "naive:      " << ms_naive << " ms, "
+              << gflops_naive << " GFLOP/s\n";
 
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // back to host
+    // ---------------------------
+    // 2) Conflicted vs swizzled
+    // ---------------------------
+
+    // warm up conflicted
+    run_sgemm_smem_conflicted(A_d, B_d, C_d, N, alpha, beta);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    float ms_conflicted = 0.0f;
+    float ms_swizzled = 0.0f;
+
+    // --- conflicted ---
+    CHECK_CUDA(cudaMemset(C_d, 0, bytes));
+    CHECK_CUDA(cudaEventRecord(start));
+    run_sgemm_smem_conflicted(A_d, B_d, C_d, N, alpha, beta);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaEventElapsedTime(&ms_conflicted, start, stop));
+
+    double gflops_conflicted = flops / (ms_conflicted * 1e6);
+
+    // --- swizzled ---
+    CHECK_CUDA(cudaMemset(C_d, 0, bytes));
+    CHECK_CUDA(cudaEventRecord(start));
+    run_sgemm_smem_swizzled(A_d, B_d, C_d, N, alpha, beta);
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaEventElapsedTime(&ms_swizzled, start, stop));
+
+    double gflops_swizzled = flops / (ms_swizzled * 1e6);
+
+    // Copy SWIZZLED result to host for correctness check
     CHECK_CUDA(cudaMemcpy(C_h, C_d, bytes, cudaMemcpyDeviceToHost));
 
-    // now run cublas gemm to check results
+    std::cout << "conflicted: " << ms_conflicted << " ms, "
+              << gflops_conflicted << " GFLOP/s\n";
+    std::cout << "swizzled:   " << ms_swizzled << " ms, "
+              << gflops_swizzled << " GFLOP/s\n";
+
+    // ---------------------------
+    // 3) cuBLAS reference + diff
+    // ---------------------------
     cublasHandle_t handle;
     CHECK_CUBLAS(cublasCreate(&handle));
-    CHECK_CUDA(cudaEventRecord(start));
 
+    CHECK_CUDA(cudaEventRecord(start));
     CHECK_CUBLAS(
         cublasSgemm(handle,
                     CUBLAS_OP_N, CUBLAS_OP_N,
@@ -104,19 +142,16 @@ int main()
                     A_d, N,
                     &beta,
                     C_d_ref, N));
-
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
     float ms_cublas = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&ms_cublas, start, stop));
+    double gflops_cublas = flops / (ms_cublas * 1e6);
 
-    double ops_cublas = 2.0 * static_cast<double>(N) * N * N;
-    double secs_cublas = ms_cublas * 1e-3;
-    double gflops_cublas = (ops_cublas / secs_cublas) * 1e-9;
+    std::cout << "cuBLAS:     " << ms_cublas << " ms, "
+              << gflops_cublas << " GFLOP/s\n";
 
-    std::cout << "cuBLAS time:  " << ms_cublas << " ms\n";
-    std::cout << "cuBLAS perf:  " << gflops_cublas << " GFLOPS\n";
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(C_h_ref, C_d_ref, bytes, cudaMemcpyDeviceToHost));
 
@@ -128,10 +163,9 @@ int main()
             max_diff = diff;
     }
 
-    std::cout << "Result diff : " << max_diff << std::endl;
+    std::cout << "Result diff (swizzled vs cuBLAS): " << max_diff << std::endl;
 
     CHECK_CUBLAS(cublasDestroy(handle));
-
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 
