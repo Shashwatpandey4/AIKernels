@@ -67,9 +67,13 @@ int main()
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
+    // FLOP count for N x N SGEMM
+    double flops = 2.0 * static_cast<double>(N) * N * N;
+
     // --------------------
     // 1) Naive kernel perf
     // --------------------
+    /*
     CHECK_CUDA(cudaEventRecord(start));
     run_sgemm_naive(A_d, B_d, C_d, N, alpha, beta);
     CHECK_CUDA(cudaEventRecord(stop));
@@ -78,7 +82,6 @@ int main()
     float ms_naive = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&ms_naive, start, stop));
 
-    double flops = 2.0 * static_cast<double>(N) * N * N;
     double gflops_naive = flops / (ms_naive * 1e6);
 
     std::cout << "naive:      " << ms_naive << " ms, "
@@ -86,18 +89,24 @@ int main()
 
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
+    */
 
     // ---------------------------
     // 2) Conflicted vs swizzled
     // ---------------------------
 
+    // Only run SWIZZLED; comment out conflicted and its timing.
+    /*
     // warm up conflicted
     run_sgemm_smem_conflicted(A_d, B_d, C_d, N, alpha, beta);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     float ms_conflicted = 0.0f;
+    */
+
     float ms_swizzled = 0.0f;
 
+    /*
     // --- conflicted ---
     CHECK_CUDA(cudaMemset(C_d, 0, bytes));
     CHECK_CUDA(cudaEventRecord(start));
@@ -107,8 +116,9 @@ int main()
     CHECK_CUDA(cudaEventElapsedTime(&ms_conflicted, start, stop));
 
     double gflops_conflicted = flops / (ms_conflicted * 1e6);
+    */
 
-    // --- swizzled ---
+    // --- swizzled ONLY ---
     CHECK_CUDA(cudaMemset(C_d, 0, bytes));
     CHECK_CUDA(cudaEventRecord(start));
     run_sgemm_smem_swizzled(A_d, B_d, C_d, N, alpha, beta);
@@ -118,17 +128,20 @@ int main()
 
     double gflops_swizzled = flops / (ms_swizzled * 1e6);
 
-    // Copy SWIZZLED result to host for correctness check
+    // Copy SWIZZLED result to host (optional, in case you still want it around)
     CHECK_CUDA(cudaMemcpy(C_h, C_d, bytes, cudaMemcpyDeviceToHost));
 
+    /*
     std::cout << "conflicted: " << ms_conflicted << " ms, "
               << gflops_conflicted << " GFLOP/s\n";
+    */
     std::cout << "swizzled:   " << ms_swizzled << " ms, "
               << gflops_swizzled << " GFLOP/s\n";
 
     // ---------------------------
     // 3) cuBLAS reference + diff
     // ---------------------------
+    /*
     cublasHandle_t handle;
     CHECK_CUBLAS(cublasCreate(&handle));
 
@@ -166,6 +179,8 @@ int main()
     std::cout << "Result diff (swizzled vs cuBLAS): " << max_diff << std::endl;
 
     CHECK_CUBLAS(cublasDestroy(handle));
+    */
+
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 
