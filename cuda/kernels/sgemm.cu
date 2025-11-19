@@ -1,6 +1,8 @@
-// 2x2 Register tiling
+/*
+  smem tiled + 4x4 register tiling, TILE_SIZE = 32
+*/
 
-#define TILE_SIZE 16
+#define TILE_SIZE 32
 
 __global__ void sgemm(const float *__restrict__ A,
                       const float *__restrict__ B,
@@ -10,91 +12,129 @@ __global__ void sgemm(const float *__restrict__ A,
                       float beta)
 {
     // 8x8 threads per block
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
+    int tx = threadIdx.x; // 0..7
+    int ty = threadIdx.y; // 0..7
 
-    // output tile origin
+    // Each block computes a 32x32 tile of C
     int tileRow = blockIdx.y * TILE_SIZE;
     int tileCol = blockIdx.x * TILE_SIZE;
 
-    // each thread computes a 2×2 block:
-    int row0 = tileRow + ty * 2;
-    int col0 = tileCol + tx * 2;
+    // This thread's 4x4 micro-tile inside that 32x32 tile
+    int row0 = tileRow + ty * 4; // base row of this thread's 4x4 patch
+    int col0 = tileCol + tx * 4; // base col of this thread's 4x4 patch
 
     __shared__ float As[TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
-    float c00 = 0.f, c01 = 0.f;
-    float c10 = 0.f, c11 = 0.f;
+    // 4x4 accumulators in registers
+    float c[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            c[i][j] = 0.0f;
 
     int numTiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+    int linearTid = ty * blockDim.x + tx;  // 0..63
+    int loaders = blockDim.x * blockDim.y; // 64
 
-    for (int t = 0; t < numTiles; t++)
+    for (int t = 0; t < numTiles; ++t)
     {
-        int globalK = t * TILE_SIZE;
+        int kBase = t * TILE_SIZE;
 
-        int loadRow = tileRow + ty * 2 + (tx / 8);
-        int loadCol = globalK + (tx % 8) * 2 + (ty / 8);
+        // ----------------------------------------------------
+        // Load As and Bs tiles cooperatively into shared memory
+        // Each block loads 32x32 = 1024 elements; 64 threads
+        // → 16 elements per thread (strided loop)
+        // ----------------------------------------------------
+        for (int idx = linearTid; idx < TILE_SIZE * TILE_SIZE; idx += loaders)
+        {
+            int r = idx / TILE_SIZE;    // 0..31
+            int ccol = idx % TILE_SIZE; // 0..31
 
-        int sRow = ty * 2 + (tx / 8);
-        int sCol = (tx % 8) * 2 + (ty / 8);
+            int aRow = tileRow + r;
+            int aCol = kBase + ccol;
 
-        // load A
-        if (loadRow < N && loadCol < N)
-            As[sRow][sCol] = A[loadRow * N + loadCol];
-        else
-            As[sRow][sCol] = 0.f;
+            if (aRow < N && aCol < N)
+                As[r][ccol] = A[aRow * N + aCol];
+            else
+                As[r][ccol] = 0.0f;
 
-        // load B
-        loadRow = globalK + ty * 2 + (tx / 8);
-        loadCol = tileCol + (tx % 8) * 2 + (ty / 8);
+            int bRow = kBase + r;
+            int bCol = tileCol + ccol;
 
-        if (loadRow < N && loadCol < N)
-            Bs[sRow][sCol] = B[loadRow * N + loadCol];
-        else
-            Bs[sRow][sCol] = 0.f;
+            if (bRow < N && bCol < N)
+                Bs[r][ccol] = B[bRow * N + bCol];
+            else
+                Bs[r][ccol] = 0.0f;
+        }
 
         __syncthreads();
 
-        // Compute 2×2 tile
-        for (int k = 0; k < TILE_SIZE; k++)
+// Compute this thread's 4x4 micro-tile from this K-tile
+#pragma unroll
+        for (int k = 0; k < TILE_SIZE; ++k)
         {
-            float a0 = As[ty * 2 + 0][k];
-            float a1 = As[ty * 2 + 1][k];
-            float b0 = Bs[k][tx * 2 + 0];
-            float b1 = Bs[k][tx * 2 + 1];
+            // Load 4 A values (4 rows for this thread)
+            float a_vec[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+                int sRow = ty * 4 + i; // 0..31 within tile
+                a_vec[i] = As[sRow][k];
+            }
 
-            c00 += a0 * b0;
-            c01 += a0 * b1;
-            c10 += a1 * b0;
-            c11 += a1 * b1;
+            // Load 4 B values (4 cols for this thread)
+            float b_vec[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                int sCol = tx * 4 + j; // 0..31 within tile
+                b_vec[j] = Bs[k][sCol];
+            }
+
+// 4x4 outer product → accumulate into c[i][j]
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    c[i][j] += a_vec[i] * b_vec[j];
         }
 
         __syncthreads();
     }
 
-    // Store output (with bounds checks)
-    if (row0 < N)
+// Write results to C (with bounds checks)
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
     {
-        if (col0 < N)
-            C[row0 * N + col0] = alpha * c00 + beta * C[row0 * N + col0];
-        if (col0 + 1 < N)
-            C[row0 * N + col0 + 1] = alpha * c01 + beta * C[row0 * N + col0 + 1];
-    }
+        int r = row0 + i;
+        if (r >= N)
+            continue;
 
-    if (row0 + 1 < N)
-    {
-        if (col0 < N)
-            C[(row0 + 1) * N + col0] = alpha * c10 + beta * C[(row0 + 1) * N + col0];
-        if (col0 + 1 < N)
-            C[(row0 + 1) * N + col0 + 1] = alpha * c11 + beta * C[(row0 + 1) * N + col0 + 1];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            int ccol = col0 + j;
+            if (ccol >= N)
+                continue;
+
+            int idx = r * N + ccol;
+            C[idx] = alpha * c[i][j] + beta * C[idx];
+        }
     }
 }
 
-void run_sgemm(const float *A_d, const float *B_d, float *C_d, int N, float alpha, float beta)
+void run_sgemm(const float *A_d,
+               const float *B_d,
+               float *C_d,
+               int N,
+               float alpha,
+               float beta)
 {
-    dim3 block(TILE_SIZE / 2, TILE_SIZE / 2);
-    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (N + TILE_SIZE - 1) / TILE_SIZE);
+    dim3 block(TILE_SIZE / 4, TILE_SIZE / 4); // 8 x 8 threads
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE,
+              (N + TILE_SIZE - 1) / TILE_SIZE);
 
     sgemm<<<grid, block>>>(A_d, B_d, C_d, N, alpha, beta);
 }
