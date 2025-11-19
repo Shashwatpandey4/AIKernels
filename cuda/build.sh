@@ -13,17 +13,29 @@ echo "building sgemm... "
 
 nvcc \
   "${SCRIPT_DIR}/host/main.cu" \
-  "${SCRIPT_DIR}/kernels/sgemm_naive.cu" \
-  "${SCRIPT_DIR}/kernels/sgemm_smem.cu" \
-  "${SCRIPT_DIR}/kernels/sgemm_swizzled.cu" \
-  -lcublas \
+  "${SCRIPT_DIR}/kernels/sgemm.cu" \
   -o "${BINARY}"
 
 echo "build complete"
+echo
 
-echo "running sgemm"
-echo "---------------------"
-"${BINARY}"
-echo "---------------------"
+echo "benchmarking"
+echo "-----------------------------------------------------"
+sum=0
+count=0
 
+for i in {1..10}; do
+    output=$("${BINARY}")
 
+    gflops=$(echo "$output" | awk '{print $(NF-1)}' | tail -n1)
+    echo "Run $i: $gflops GFLOP/s"
+
+    if (( i > 1 )); then
+        sum=$(echo "$sum + $gflops" | bc -l)
+        count=$((count+1))
+    fi
+done
+
+avg=$(echo "scale=3; $sum / $count" | bc -l)
+echo "-----------------------------------------------------"
+echo "Average : $avg GFLOP/s"
