@@ -4,7 +4,7 @@
 #include <cmath>
 #include "cuda_utils.cuh"
 #include "../kernels/sgemm.cuh"
-
+#include <cublas_v2.h>
 #define N 8192
 
 int main()

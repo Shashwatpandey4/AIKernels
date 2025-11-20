@@ -1,10 +1,11 @@
-// 64x64 tile per block, 16x16 threads, 4x4 micro-tile per thread
-// cp.async + double-buffered tiles in shared memory.
+// 64x64 tile per block, 8x8 threads, 8x8 micro-tile per thread
+// cp.async + double-buffered tiles in shared memory
+// General GEMM: C = alpha * A * B + beta * C
 
 #define BLOCK_M 64
 #define BLOCK_N 64
 #define K_TILE 32
-#define PAD 4 // to make row strides 16B-aligned for cp.async dest
+#define PAD 4 // to keep row strides 16B-friendly for cp.async dest
 
 __global__ void sgemm(const float *__restrict__ A,
                       const float *__restrict__ B,
@@ -13,20 +14,20 @@ __global__ void sgemm(const float *__restrict__ A,
                       float alpha,
                       float beta)
 {
-    // 16x16 threads per block
-    int tx = threadIdx.x; // 0..15
-    int ty = threadIdx.y; // 0..15
+    // 8x8 threads per block → 64 threads → 2 warps
+    int tx = threadIdx.x; // 0..7
+    int ty = threadIdx.y; // 0..7
 
-    int tid = ty * blockDim.x + tx;        // 0..255
-    int loaders = blockDim.x * blockDim.y; // 256
+    int tid = ty * blockDim.x + tx;        // 0..63
+    int loaders = blockDim.x * blockDim.y; // 64
 
-    // Each block computes a 64x64 tile of C
+    // Each block computes one 64x64 tile of C
     int blockRow = blockIdx.y * BLOCK_M; // row offset in C
     int blockCol = blockIdx.x * BLOCK_N; // col offset in C
 
-    // This thread's 4x4 micro-tile inside that 64x64 tile
-    int row0 = blockRow + ty * 4; // base row of this thread's 4x4 patch
-    int col0 = blockCol + tx * 4; // base col of this thread's 4x4 patch
+    // This thread's 8x8 micro-tile inside that 64x64 tile
+    int row0 = blockRow + ty * 8; // base row of this thread's 8x8 patch
+    int col0 = blockCol + tx * 8; // base col of this thread's 8x8 patch
 
     // Double-buffered, padded shared memory tiles:
     // A: [BLOCK_M x K_TILE]
@@ -34,12 +35,12 @@ __global__ void sgemm(const float *__restrict__ A,
     __shared__ float As[2][BLOCK_M][K_TILE + PAD];
     __shared__ float Bs[2][K_TILE][BLOCK_N + PAD];
 
-    // 4x4 accumulators in registers
-    float c[4][4];
+    // 8x8 accumulators in registers (64 floats)
+    float c[8][8];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 8; ++i)
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < 8; ++j)
             c[i][j] = 0.0f;
 
     // Number of K-tiles
@@ -67,12 +68,12 @@ __global__ void sgemm(const float *__restrict__ A,
     {
         int kBase0 = 0;
 
-        // Load A tile: [BLOCK_M x K_TILE]
+        // Load A tile: [BLOCK_M x K_TILE] = [64 x 32]
         for (int idx = tid; idx < totalVecsA; idx += loaders)
         {
             int elem = idx * 4;     // scalar index 0..(BLOCK_M*K_TILE-1)
             int r = elem / K_TILE;  // 0..63
-            int k4 = elem % K_TILE; // 0,4,...,28 (since /4 then *4)
+            int k4 = elem % K_TILE; // 0,4,...,28
 
             int aIndex = (blockRow + r) * N + (kBase0 + k4);
             const float *aPtr = &A[aIndex];
@@ -80,7 +81,7 @@ __global__ void sgemm(const float *__restrict__ A,
             cp_async_16(&As[buf][r][k4], aPtr);
         }
 
-        // Load B tile: [K_TILE x BLOCK_N]
+        // Load B tile: [K_TILE x BLOCK_N] = [32 x 64]
         for (int idx = tid; idx < totalVecsB; idx += loaders)
         {
             int elem = idx * 4;      // scalar index
@@ -104,12 +105,11 @@ __global__ void sgemm(const float *__restrict__ A,
     for (int t = 0; t < numTiles; ++t)
     {
         int next = buf ^ 1;
+        int kBaseNext = (t + 1) * K_TILE;
 
         // Prefetch next K-tile into the other buffer
         if (t + 1 < numTiles)
         {
-            int kBaseNext = (t + 1) * K_TILE;
-
             // A: [BLOCK_M x K_TILE] at K = kBaseNext
             for (int idx = tid; idx < totalVecsA; idx += loaders)
             {
@@ -141,30 +141,31 @@ __global__ void sgemm(const float *__restrict__ A,
 
         // -----------------------------
         // Compute on current buffer
+        // Each thread computes 8x8 outputs
         // -----------------------------
 #pragma unroll
         for (int kk = 0; kk < K_TILE; ++kk)
         {
-            float a_vec[4];
+            float a_vec[8];
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 8; ++i)
             {
-                int sRow = ty * 4 + i; // 0..63
+                int sRow = ty * 8 + i; // 0..63
                 a_vec[i] = As[buf][sRow][kk];
             }
 
-            float b_vec[4];
+            float b_vec[8];
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
+            for (int j = 0; j < 8; ++j)
             {
-                int sCol = tx * 4 + j; // 0..63
+                int sCol = tx * 8 + j; // 0..63
                 b_vec[j] = Bs[buf][kk][sCol];
             }
 
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j)
+                for (int j = 0; j < 8; ++j)
                     c[i][j] += a_vec[i] * b_vec[j];
         }
 
@@ -177,10 +178,12 @@ __global__ void sgemm(const float *__restrict__ A,
     }
 
     // ---------------------------------
-    // Write results to C (vectorized when possible)
+    // Write results to C
+    // C = alpha * acc + beta * C
+    // Vectorized across 8-wide row (two float4s)
     // ---------------------------------
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 8; ++i)
     {
         int r = row0 + i;
         if (r >= N)
@@ -188,29 +191,48 @@ __global__ void sgemm(const float *__restrict__ A,
 
         int baseIdx = r * N + col0; // index of (r, col0)
 
-        // Vectorized path if 4-wide and 16B aligned (always true for nice N, but keep check)
-        if ((col0 + 3) < N && ((baseIdx & 3) == 0))
+        // For nice N (multiple of 64), this will always be true,
+        // but keep the checks for generality.
+        if ((col0 + 7) < N && ((baseIdx & 3) == 0)) // baseIdx % 4 == 0 → 16B aligned
         {
-            float4 acc;
-            acc.x = c[i][0];
-            acc.y = c[i][1];
-            acc.z = c[i][2];
-            acc.w = c[i][3];
+            // First 4 columns
+            float4 acc0;
+            acc0.x = c[i][0];
+            acc0.y = c[i][1];
+            acc0.z = c[i][2];
+            acc0.w = c[i][3];
 
-            float4 old = *reinterpret_cast<const float4 *>(&C[baseIdx]);
+            float4 old0 = *reinterpret_cast<const float4 *>(&C[baseIdx]);
 
-            float4 out;
-            out.x = alpha * acc.x + beta * old.x;
-            out.y = alpha * acc.y + beta * old.y;
-            out.z = alpha * acc.z + beta * old.z;
-            out.w = alpha * acc.w + beta * old.w;
+            float4 out0;
+            out0.x = alpha * acc0.x + beta * old0.x;
+            out0.y = alpha * acc0.y + beta * old0.y;
+            out0.z = alpha * acc0.z + beta * old0.z;
+            out0.w = alpha * acc0.w + beta * old0.w;
 
-            *reinterpret_cast<float4 *>(&C[baseIdx]) = out;
+            *reinterpret_cast<float4 *>(&C[baseIdx]) = out0;
+
+            // Next 4 columns
+            float4 acc1;
+            acc1.x = c[i][4];
+            acc1.y = c[i][5];
+            acc1.z = c[i][6];
+            acc1.w = c[i][7];
+
+            float4 old1 = *reinterpret_cast<const float4 *>(&C[baseIdx + 4]);
+
+            float4 out1;
+            out1.x = alpha * acc1.x + beta * old1.x;
+            out1.y = alpha * acc1.y + beta * old1.y;
+            out1.z = alpha * acc1.z + beta * old1.z;
+            out1.w = alpha * acc1.w + beta * old1.w;
+
+            *reinterpret_cast<float4 *>(&C[baseIdx + 4]) = out1;
         }
         else
         {
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
+            for (int j = 0; j < 8; ++j)
             {
                 int ccol = col0 + j;
                 if (ccol >= N)
@@ -218,7 +240,7 @@ __global__ void sgemm(const float *__restrict__ A,
 
                 int idx = baseIdx + j;
                 float old = C[idx];
-                C[idx] = alpha * c[i][j] + beta * old;
+                C[idx = idx] = alpha * c[i][j] + beta * old;
             }
         }
     }
@@ -232,7 +254,7 @@ void run_sgemm(const float *A_d,
                float beta)
 {
     // assumes N is a multiple of 64 and 4
-    dim3 block(16, 16);                  // 16 x 16 threads
+    dim3 block(8, 8);                    // 8 x 8 threads = 64 threads per block
     dim3 grid(N / BLOCK_N, N / BLOCK_M); // N / 64 in each dimension
 
     sgemm<<<grid, block>>>(A_d, B_d, C_d, N, alpha, beta);

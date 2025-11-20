@@ -15,6 +15,7 @@ nvcc \
   -arch=sm_89\
   "${SCRIPT_DIR}/host/main.cu" \
   "${SCRIPT_DIR}/kernels/sgemm.cu" \
+  -lcublas\
   -o "${BINARY}"
 
 echo "build complete"
