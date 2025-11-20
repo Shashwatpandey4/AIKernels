@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
 # resolve paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/.."
@@ -12,6 +11,8 @@ mkdir -p "${BUILD_DIR}"
 echo "building sgemm... "
 
 nvcc \
+  -O3\
+  -arch=sm_89\
   "${SCRIPT_DIR}/host/main.cu" \
   "${SCRIPT_DIR}/kernels/sgemm.cu" \
   -o "${BINARY}"
