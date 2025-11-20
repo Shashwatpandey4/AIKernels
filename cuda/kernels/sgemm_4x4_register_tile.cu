@@ -12,8 +12,8 @@ __global__ void sgemm(const float *__restrict__ A,
                       float beta)
 {
     // 8x8 threads per block
-    int tx = threadIdx.x; // 0..7
-    int ty = threadIdx.y; // 0..7
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
     // Each block computes a 32x32 tile of C
     int tileRow = blockIdx.y * TILE_SIZE;
