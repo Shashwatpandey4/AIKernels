@@ -3,7 +3,7 @@
 #include <ctime>
 #include <cmath>
 #include "cuda_utils.cuh"
-#include "../kernels/sgemm.cuh"
+#include "../kernels/sgemm_cublas.cuh"
 #include <cublas_v2.h>
 
 #define N 8192
@@ -50,8 +50,17 @@ int main()
     float alpha = 1.0f;
     float beta = 0.0f;
 
+    // Create cuBLAS handle (outside timed region)
+    cublasHandle_t handle;
+    cublasStatus_t stat = cublasCreate(&handle);
+    if (stat != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "cublasCreate failed: " << stat << "\n";
+        return EXIT_FAILURE;
+    }
+
     // Warm-up
-    run_sgemm(A_d, B_d, C_d, N, alpha, beta);
+    run_sgemm(handle, A_d, B_d, C_d, N, alpha, beta);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Create timing events
@@ -62,7 +71,7 @@ int main()
     // Time multiple iterations
     CHECK_CUDA(cudaEventRecord(start));
 
-    run_sgemm(A_d, B_d, C_d, N, alpha, beta);
+    run_sgemm(handle, A_d, B_d, C_d, N, alpha, beta);
 
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -78,6 +87,8 @@ int main()
 
     std::cout << "Performance:  " << gflops << " GFLOP/s\n";
 
+    // Destroy resources
+    cublasDestroy(handle);
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 

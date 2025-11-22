@@ -1,11 +1,5 @@
-// 64x64 tile per block, 8x8 threads, 8x8 micro-tile per thread
-// cp.async + double-buffered tiles in shared memory
-// General GEMM: C = alpha * A * B + beta * C
-
-#define BLOCK_M 64
-#define BLOCK_N 64
-#define K_TILE 32
-#define PAD 4 // to keep row strides 16B-friendly for cp.async dest
+// vectorized ld/st
+#define TILE_SIZE 32
 
 __global__ void sgemm(const float *__restrict__ A,
                       const float *__restrict__ B,
@@ -14,176 +8,117 @@ __global__ void sgemm(const float *__restrict__ A,
                       float alpha,
                       float beta)
 {
-    // 8x8 threads per block → 64 threads → 2 warps
-    int tx = threadIdx.x; // 0..7
-    int ty = threadIdx.y; // 0..7
+    // 8x8 threads per block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    int tid = ty * blockDim.x + tx;        // 0..63
-    int loaders = blockDim.x * blockDim.y; // 64
+    // Each block computes a 32x32 tile of C
+    int tileRow = blockIdx.y * TILE_SIZE;
+    int tileCol = blockIdx.x * TILE_SIZE;
 
-    // Each block computes one 64x64 tile of C
-    int blockRow = blockIdx.y * BLOCK_M; // row offset in C
-    int blockCol = blockIdx.x * BLOCK_N; // col offset in C
+    // This thread's 4x4 micro-tile inside that 32x32 tile
+    int row0 = tileRow + ty * 4; // base row of this thread's 4x4 patch
+    int col0 = tileCol + tx * 4; // base col of this thread's 4x4 patch
 
-    // This thread's 8x8 micro-tile inside that 64x64 tile
-    int row0 = blockRow + ty * 8; // base row of this thread's 8x8 patch
-    int col0 = blockCol + tx * 8; // base col of this thread's 8x8 patch
+    __shared__ float As[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE + 1];
 
-    // Double-buffered, padded shared memory tiles:
-    // A: [BLOCK_M x K_TILE]
-    // B: [K_TILE  x BLOCK_N]
-    __shared__ float As[2][BLOCK_M][K_TILE + PAD];
-    __shared__ float Bs[2][K_TILE][BLOCK_N + PAD];
-
-    // 8x8 accumulators in registers (64 floats)
-    float c[8][8];
+    // 4x4 accumulators in registers
+    float c[4][4];
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 4; ++i)
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < 4; ++j)
             c[i][j] = 0.0f;
 
-    // Number of K-tiles
-    int numTiles = N / K_TILE; // assumes N % K_TILE == 0
+    int numTiles = N / TILE_SIZE;          // assumes N % TILE_SIZE == 0
+    int linearTid = ty * blockDim.x + tx;  // 0..63
+    int loaders = blockDim.x * blockDim.y; // 64
 
-    // Total 16B chunks in each A and B tile
-    const int totalVecsA = (BLOCK_M * K_TILE) / 4; // 64*32/4 = 512
-    const int totalVecsB = (K_TILE * BLOCK_N) / 4; // 32*64/4 = 512
+    // reinterpret bases once; we index in units of float4
+    const float4 *A4 = reinterpret_cast<const float4 *>(A);
+    const float4 *B4 = reinterpret_cast<const float4 *>(B);
 
-    // Helper: one 16B cp.async from global to shared
-    auto cp_async_16 = [](void *dst_smem, const void *src_gmem)
-    {
-        unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(dst_smem));
-        unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(src_gmem);
-        asm volatile(
-            "cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(gmem_addr));
-    };
+    // Each 32x32 tile = 1024 floats = 256 float4s
+    const int totalVecs = (TILE_SIZE * TILE_SIZE) / 4; // 256
 
-    int buf = 0;
-
-    // ---------------------------------
-    // Preload K-tile 0 into buffer 0
-    // ---------------------------------
-    if (numTiles > 0)
-    {
-        int kBase0 = 0;
-
-        // Load A tile: [BLOCK_M x K_TILE] = [64 x 32]
-        for (int idx = tid; idx < totalVecsA; idx += loaders)
-        {
-            int elem = idx * 4;     // scalar index 0..(BLOCK_M*K_TILE-1)
-            int r = elem / K_TILE;  // 0..63
-            int k4 = elem % K_TILE; // 0,4,...,28
-
-            int aIndex = (blockRow + r) * N + (kBase0 + k4);
-            const float *aPtr = &A[aIndex];
-
-            cp_async_16(&As[buf][r][k4], aPtr);
-        }
-
-        // Load B tile: [K_TILE x BLOCK_N] = [32 x 64]
-        for (int idx = tid; idx < totalVecsB; idx += loaders)
-        {
-            int elem = idx * 4;      // scalar index
-            int k = elem / BLOCK_N;  // 0..31
-            int c4 = elem % BLOCK_N; // 0,4,...,60
-
-            int bIndex = (kBase0 + k) * N + (blockCol + c4);
-            const float *bPtr = &B[bIndex];
-
-            cp_async_16(&Bs[buf][k][c4], bPtr);
-        }
-
-        asm volatile("cp.async.commit_group;\n");
-        asm volatile("cp.async.wait_group 0;\n");
-        __syncthreads();
-    }
-
-    // ---------------------------------
-    // Main K-loop with double buffering
-    // ---------------------------------
     for (int t = 0; t < numTiles; ++t)
     {
-        int next = buf ^ 1;
-        int kBaseNext = (t + 1) * K_TILE;
+        int kBase = t * TILE_SIZE;
 
-        // Prefetch next K-tile into the other buffer
-        if (t + 1 < numTiles)
+        // Vectorized load: GMEM -> SMEM
+        // No bounds checks; assumes all tiles are "interior".
+
+        for (int vidx = linearTid; vidx < totalVecs; vidx += loaders)
         {
-            // A: [BLOCK_M x K_TILE] at K = kBaseNext
-            for (int idx = tid; idx < totalVecsA; idx += loaders)
-            {
-                int elem = idx * 4;
-                int r = elem / K_TILE;
-                int k4 = elem % K_TILE;
+            int elemIdx = vidx * 4;       // scalar index in 0..1020
+            int r = elemIdx / TILE_SIZE;  // row 0..31
+            int c4 = elemIdx % TILE_SIZE; // col {0,4,8,...,28}
 
-                int aIndex = (blockRow + r) * N + (kBaseNext + k4);
-                const float *aPtr = &A[aIndex];
+            // Global scalar indices
+            int aIndex = (tileRow + r) * N + (kBase + c4);
+            int bIndex = (kBase + r) * N + (tileCol + c4);
 
-                cp_async_16(&As[next][r][k4], aPtr);
-            }
+            // Because:
+            // - N % 4 == 0
+            // - tileRow, tileCol, kBase multiples of 32
+            // => aIndex and bIndex are multiples of 4
+            // => aIndex/4, bIndex/4 are valid indices into float4*
+            float4 a4 = A4[aIndex / 4];
+            float4 b4 = B4[bIndex / 4];
 
-            // B: [K_TILE x BLOCK_N] at K = kBaseNext
-            for (int idx = tid; idx < totalVecsB; idx += loaders)
-            {
-                int elem = idx * 4;
-                int k = elem / BLOCK_N;
-                int c4 = elem % BLOCK_N;
+            // Scatter into shared memory as scalars
+            As[r][c4 + 0] = a4.x;
+            As[r][c4 + 1] = a4.y;
+            As[r][c4 + 2] = a4.z;
+            As[r][c4 + 3] = a4.w;
 
-                int bIndex = (kBaseNext + k) * N + (blockCol + c4);
-                const float *bPtr = &B[bIndex];
-
-                cp_async_16(&Bs[next][k][c4], bPtr);
-            }
-
-            asm volatile("cp.async.commit_group;\n");
+            Bs[r][c4 + 0] = b4.x;
+            Bs[r][c4 + 1] = b4.y;
+            Bs[r][c4 + 2] = b4.z;
+            Bs[r][c4 + 3] = b4.w;
         }
 
-        // -----------------------------
-        // Compute on current buffer
-        // Each thread computes 8x8 outputs
-        // -----------------------------
+        __syncthreads();
+
+        // Compute this thread's 4x4 micro-tile for this K-tile
 #pragma unroll
-        for (int kk = 0; kk < K_TILE; ++kk)
+        for (int k = 0; k < TILE_SIZE; ++k)
         {
-            float a_vec[8];
+            float a_vec[4];
 #pragma unroll
-            for (int i = 0; i < 8; ++i)
+            for (int i = 0; i < 4; ++i)
             {
-                int sRow = ty * 8 + i; // 0..63
-                a_vec[i] = As[buf][sRow][kk];
+                int sRow = ty * 4 + i;
+                a_vec[i] = As[sRow][k];
             }
 
-            float b_vec[8];
+            float b_vec[4];
 #pragma unroll
-            for (int j = 0; j < 8; ++j)
+            for (int j = 0; j < 4; ++j)
             {
-                int sCol = tx * 8 + j; // 0..63
-                b_vec[j] = Bs[buf][kk][sCol];
+                int sCol = tx * 4 + j;
+                b_vec[j] = Bs[k][sCol];
             }
 
 #pragma unroll
-            for (int i = 0; i < 8; ++i)
+            for (int i = 0; i < 4; ++i)
 #pragma unroll
-                for (int j = 0; j < 8; ++j)
+                for (int j = 0; j < 4; ++j)
                     c[i][j] += a_vec[i] * b_vec[j];
         }
 
-        if (t + 1 < numTiles)
-        {
-            asm volatile("cp.async.wait_group 0;\n");
-            __syncthreads();
-            buf = next;
-        }
+        __syncthreads();
     }
 
-    // ---------------------------------
+    // --------------------------------------------------------
     // Write results to C
-    // C = alpha * acc + beta * C
-    // Vectorized across 8-wide row (two float4s)
-    // ---------------------------------
+    // Here we *could* skip bounds checks for nice N, but they’re
+    // cheap compared to the inner loop, and this path runs once.
+    // --------------------------------------------------------
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    // Write results to C (vectorized when possible)
+    for (int i = 0; i < 4; ++i)
     {
         int r = row0 + i;
         if (r >= N)
@@ -191,48 +126,32 @@ __global__ void sgemm(const float *__restrict__ A,
 
         int baseIdx = r * N + col0; // index of (r, col0)
 
-        // For nice N (multiple of 64), this will always be true,
-        // but keep the checks for generality.
-        if ((col0 + 7) < N && ((baseIdx & 3) == 0)) // baseIdx % 4 == 0 → 16B aligned
+        // Try vectorized path if the whole 4-wide row is in-bounds AND aligned
+        if ((col0 + 3) < N && ((baseIdx & 3) == 0)) // baseIdx % 4 == 0 → 16B aligned
         {
-            // First 4 columns
-            float4 acc0;
-            acc0.x = c[i][0];
-            acc0.y = c[i][1];
-            acc0.z = c[i][2];
-            acc0.w = c[i][3];
+            float4 acc; // accumulators for this row
+            acc.x = c[i][0];
+            acc.y = c[i][1];
+            acc.z = c[i][2];
+            acc.w = c[i][3];
 
-            float4 old0 = *reinterpret_cast<const float4 *>(&C[baseIdx]);
+            // load 4 existing C values
+            float4 old = *reinterpret_cast<const float4 *>(&C[baseIdx]);
 
-            float4 out0;
-            out0.x = alpha * acc0.x + beta * old0.x;
-            out0.y = alpha * acc0.y + beta * old0.y;
-            out0.z = alpha * acc0.z + beta * old0.z;
-            out0.w = alpha * acc0.w + beta * old0.w;
+            // alpha * acc + beta * old
+            float4 out;
+            out.x = alpha * acc.x + beta * old.x;
+            out.y = alpha * acc.y + beta * old.y;
+            out.z = alpha * acc.z + beta * old.z;
+            out.w = alpha * acc.w + beta * old.w;
 
-            *reinterpret_cast<float4 *>(&C[baseIdx]) = out0;
-
-            // Next 4 columns
-            float4 acc1;
-            acc1.x = c[i][4];
-            acc1.y = c[i][5];
-            acc1.z = c[i][6];
-            acc1.w = c[i][7];
-
-            float4 old1 = *reinterpret_cast<const float4 *>(&C[baseIdx + 4]);
-
-            float4 out1;
-            out1.x = alpha * acc1.x + beta * old1.x;
-            out1.y = alpha * acc1.y + beta * old1.y;
-            out1.z = alpha * acc1.z + beta * old1.z;
-            out1.w = alpha * acc1.w + beta * old1.w;
-
-            *reinterpret_cast<float4 *>(&C[baseIdx + 4]) = out1;
+            // store back
+            *reinterpret_cast<float4 *>(&C[baseIdx]) = out;
         }
         else
         {
-#pragma unroll
-            for (int j = 0; j < 8; ++j)
+            // Fallback: scalar stores with bounds checks
+            for (int j = 0; j < 4; ++j)
             {
                 int ccol = col0 + j;
                 if (ccol >= N)
@@ -240,12 +159,11 @@ __global__ void sgemm(const float *__restrict__ A,
 
                 int idx = baseIdx + j;
                 float old = C[idx];
-                C[idx = idx] = alpha * c[i][j] + beta * old;
+                C[idx] = alpha * c[i][j] + beta * old;
             }
         }
     }
 }
-
 void run_sgemm(const float *A_d,
                const float *B_d,
                float *C_d,
@@ -253,9 +171,9 @@ void run_sgemm(const float *A_d,
                float alpha,
                float beta)
 {
-    // assumes N is a multiple of 64 and 4
-    dim3 block(8, 8);                    // 8 x 8 threads = 64 threads per block
-    dim3 grid(N / BLOCK_N, N / BLOCK_M); // N / 64 in each dimension
+    // assumes N is a multiple of TILE_SIZE and 4
+    dim3 block(TILE_SIZE / 4, TILE_SIZE / 4); // 8 x 8 threads
+    dim3 grid(N / TILE_SIZE, N / TILE_SIZE);
 
     sgemm<<<grid, block>>>(A_d, B_d, C_d, N, alpha, beta);
 }

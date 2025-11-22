@@ -6,20 +6,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/.."
 BUILD_DIR="${SCRIPT_DIR}/build"
 BINARY="${BUILD_DIR}/sgemm"
+
 mkdir -p "${BUILD_DIR}"
-echo "building sgemm... "
+echo "building cublas sgemm... "
 
 nvcc \
   -O3\
-  "${SCRIPT_DIR}/host/main.cu" \
-  "${SCRIPT_DIR}/kernels/sgemm.cu" \
+  "${SCRIPT_DIR}/host/cublas_main.cu" \
+  "${SCRIPT_DIR}/kernels/sgemm_cublas.cu" \
   -lcublas\
   -o "${BINARY}"
 
 echo "build complete"
 echo
 
-echo "benchmarking"
+echo "benchmarking CuBLAS sgemm"
 echo "-----------------------------------------------------"
 sum=0
 count=0
